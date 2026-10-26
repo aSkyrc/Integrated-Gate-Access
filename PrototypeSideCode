@@ -1,0 +1,722 @@
+#!/usr/bin/env python3
+"""
+Integrated Gym Management System
+Combines RFID access control for members with manual button interface for non-members
+"""
+
+import tkinter as tk
+import threading
+import time
+import serial
+import os
+import requests
+import json
+from datetime import datetime
+from PIL import Image, ImageTk
+import RPi.GPIO as GPIO
+import pigpio
+
+# ========== API CONFIGURATION ==========
+BASE_URL = "https://jcgym.shop/api/gate"
+DEVICE_ID = "Integrated Access Gate"
+API_TIMEOUT = 5  # seconds
+
+# ========== HARDWARE CONFIGURATION ==========
+SERVO_PIN = 18
+BUZZER_PIN = 22
+PUSH_BUTTON_PIN = 24
+ESP32_PORT = '/dev/ttyUSB0'
+ESP32_BAUD_RATE = 9600
+
+# Servo angles
+OPEN_ANGLE = 145    # Gate open position
+CLOSED_ANGLE = 0    # Gate closed position
+
+# Timing
+SERVO_SPEED = 0.01      # Speed per step
+GATE_OPEN_TIME = 5      # Seconds to keep gate open after access granted
+
+# ========== AUTO-LEARNING CONFIGURATION ==========
+MAPPING_FILE = "rfid_mapping.json"
+AUTO_LEARN = True  # Enable/disable auto-learning feature
+
+# ========== COLORS FOR OUTPUT ==========
+class Colors:
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    MAGENTA = '\033[95m'
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+
+class IntegratedGymSystem:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("J7C Gym - Integrated Access System")
+        self.root.geometry("800x480")
+        self.root.configure(bg='white')
+        
+        # Make it fullscreen for better touch experience
+        self.root.attributes('-fullscreen', True)
+        
+        # System states
+        self.servo_state = False  # False = closed, True = open
+        self.buzzer_active = False
+        self.button_monitor_active = True
+        self.last_button_state = 0
+        self.rfid_scanning_active = True
+        
+        # RFID mapping
+        self.RFID_MAPPING = self.load_mapping()
+        
+        # Initialize hardware
+        self.setup_gpio()
+        self.setup_servo()
+        self.setup_esp32()
+        
+        print("Initializing Integrated Gym System...")
+        self.setup_ui()
+        print("UI setup complete!")
+        
+        # Start monitoring threads
+        self.start_button_monitoring()
+        self.start_rfid_monitoring()
+        
+    # ========== HARDWARE SETUP ==========
+    def setup_gpio(self):
+        """Initialize GPIO for buzzer and push button"""
+        try:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+            
+            # Buzzer setup
+            GPIO.setup(BUZZER_PIN, GPIO.OUT)
+            GPIO.output(BUZZER_PIN, GPIO.LOW)
+            print(f"✅ Buzzer initialized on GPIO {BUZZER_PIN}")
+            
+            # Push button setup
+            GPIO.setup(PUSH_BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+            print(f"✅ Push button initialized on GPIO {PUSH_BUTTON_PIN}")
+            
+        except Exception as e:
+            print(f"❌ GPIO initialization failed: {e}")
+    
+    def setup_servo(self):
+        """Initialize pigpio for servo control"""
+        self.pi = pigpio.pi()
+        if not self.pi.connected:
+            print("❌ pigpio not connected. Please run: sudo pigpiod")
+        else:
+            print("✅ pigpio connected successfully")
+            # Initialize servo to closed position
+            self.pi.set_servo_pulsewidth(SERVO_PIN, self.angle_to_pulse(CLOSED_ANGLE))
+            time.sleep(0.5)
+    
+    def setup_esp32(self):
+        """Initialize ESP32 connection for RFID"""
+        self.ser = None
+        try:
+            os.system(f"sudo fuser -k {ESP32_PORT} 2>/dev/null")
+            time.sleep(2)
+            
+            self.ser = serial.Serial(
+                port=ESP32_PORT,
+                baudrate=ESP32_BAUD_RATE,
+                timeout=0.1,
+                write_timeout=1
+            )
+            
+            print(f"✅ Connected to ESP32 on {ESP32_PORT}")
+            time.sleep(2)
+            self.ser.reset_input_buffer()
+            
+        except Exception as e:
+            print(f"❌ Failed to connect to ESP32: {e}")
+    
+    # ========== UI SETUP ==========
+    def setup_ui(self):
+        # Main frame
+        main_frame = tk.Frame(self.root, bg='white')
+        main_frame.pack(expand=True, fill='both', padx=30, pady=20)
+        
+        # Logo/Title at the top
+        logo_frame = tk.Frame(main_frame, bg='white')
+        logo_frame.pack(pady=(0, 20))
+        
+        # Load and display JPG logo with error handling
+        try:
+            logo_image = Image.open("/home/askyrc/Downloads/j7clogo.jpeg")
+            logo_image = logo_image.resize((120, 120), Image.LANCZOS)
+            self.logo_photo = ImageTk.PhotoImage(logo_image)
+            
+            self.logo_label = tk.Label(
+                logo_frame,
+                image=self.logo_photo,
+                bg='white'
+            )
+            self.logo_label.pack()
+            print("Logo loaded successfully with PIL!")
+            
+        except Exception as e:
+            print(f"Error loading logo: {e} - using text logo instead")
+            self.logo_label = tk.Label(
+                logo_frame, 
+                text="🏋️ J7C Gym", 
+                font=('Arial', 28, 'bold'),
+                fg='black',
+                bg='white'
+            )
+            self.logo_label.pack()
+        
+        # Welcome title below logo
+        welcome_label = tk.Label(
+            main_frame,
+            text="J7C Goodhealth Gym",
+            font=('Arial', 32, 'bold'),
+            fg='Black',
+            bg='white'
+        )
+        welcome_label.pack(pady=(0, 10))
+        
+        # Main status label
+        self.status_label = tk.Label(
+            main_frame,
+            text="Members: Tap RFID Card\nNon-Members: Press Button Below",
+            font=('Arial', 18, 'bold'),
+            fg='black',
+            bg='white',
+            height=3
+        )
+        self.status_label.pack(pady=(0, 5))
+        
+        # Non-Member Button
+        self.non_member_btn = tk.Button(
+            main_frame,
+            text="PRESS HERE!!",
+            font=('Arial', 35, 'bold'),
+            bg='black',
+            fg='yellow',
+            width=50,
+            height=5,
+            command=self.handle_non_member_click,
+            state='normal',
+            relief='raised',
+            bd=6,
+            cursor='hand2',
+            activebackground='#333333',
+            activeforeground='yellow'
+        )
+        self.non_member_btn.pack(expand=True, pady=0)
+    
+    # ========== SERVO CONTROL ==========
+    def angle_to_pulse(self, angle):
+        """Convert angle (0-180) to pulse width in microseconds"""
+        return 500 + (angle / 180.0) * 2000
+    
+    def move_servo(self, target_angle):
+        """Move servo to target angle with fixed speed"""
+        if not self.pi.connected:
+            print("❌ Servo not available - pigpiod not running")
+            return
+        
+        try:
+            current_angle = OPEN_ANGLE if self.servo_state else CLOSED_ANGLE
+            steps = abs(int(target_angle - current_angle))
+            
+            if steps == 0:
+                print(f"⚠️ Servo already at {target_angle}°")
+                return
+            
+            direction = 1 if target_angle > current_angle else -1
+            
+            print(f"⚡ Moving servo from {current_angle}° to {target_angle}° ({steps} steps)...")
+            
+            for step in range(steps + 1):
+                angle = current_angle + (step * direction)
+                pulse_width = self.angle_to_pulse(angle)
+                self.pi.set_servo_pulsewidth(SERVO_PIN, pulse_width)
+                time.sleep(SERVO_SPEED)
+            
+            # Update servo state
+            self.servo_state = (target_angle == OPEN_ANGLE)
+            
+            print(f"✅ Servo moved to {target_angle}° - Gate {'OPEN' if self.servo_state else 'CLOSED'}")
+            
+        except Exception as e:
+            print(f"❌ Error moving servo: {e}")
+    
+    def open_gate(self):
+        """Open the gate"""
+        print(f"{Colors.GREEN}🚪 Opening gate...{Colors.RESET}")
+        threading.Thread(target=self.move_servo, args=(OPEN_ANGLE,), daemon=True).start()
+    
+    def close_gate(self):
+        """Close the gate"""
+        print(f"{Colors.BLUE}🚪 Closing gate...{Colors.RESET}")
+        threading.Thread(target=self.move_servo, args=(CLOSED_ANGLE,), daemon=True).start()
+    
+    # ========== BUTTON MONITORING ==========
+    def start_button_monitoring(self):
+        """Start monitoring the button in a separate thread"""
+        def monitor_button():
+            while self.button_monitor_active:
+                try:
+                    current_button_state = GPIO.input(PUSH_BUTTON_PIN)
+                    
+                    # Detect button press (rising edge) for servo control
+                    if current_button_state == 1 and self.last_button_state == 0:
+                        print("🔴🔴🔴 PHYSICAL BUTTON PRESSED! 🔴🔴🔴")
+                        self.root.after(0, self.push_button_callback)
+                    
+                    self.last_button_state = current_button_state
+                    time.sleep(0.1)
+                    
+                except Exception as e:
+                    print(f"Button monitoring error: {e}")
+                    time.sleep(0.1)
+        
+        self.monitor_thread = threading.Thread(target=monitor_button, daemon=True)
+        self.monitor_thread.start()
+        print("✅ Button monitoring started")
+    
+    def push_button_callback(self):
+        """Callback for physical push button - toggle gate without buzzer"""
+        print("🔄 Toggling servo position via physical button...")
+        
+        # Toggle servo position
+        if self.servo_state:  # Currently open, so close it
+            self.close_gate()
+        else:  # Currently closed, so open it
+            self.open_gate()
+    
+    # ========== NON-MEMBER HANDLING ==========
+    def handle_non_member_click(self):
+        """Handle non-member button click - activate buzzer 5 times"""
+        print("Non-member button pressed - Activating buzzer 5 times!")
+        
+        # Visual feedback
+        self.animate_button_press()
+        
+        # Disable button during buzzer activity
+        self.non_member_btn.config(state='disabled')
+        
+        # Update status
+        self.status_label.config(
+            text="Notifying Staff... Please Wait",
+            font=('Arial', 20, 'bold'),
+            fg='orange',
+            bg='white'
+        )
+        
+        # Activate buzzer in separate thread (5 times)
+        threading.Thread(target=self.activate_buzzer_5_times, daemon=True).start()
+    
+    def animate_button_press(self):
+        """Animate button press with visual feedback"""
+        original_bg = self.non_member_btn.cget('bg')
+        original_relief = self.non_member_btn.cget('relief')
+        
+        self.non_member_btn.config(bg='#222222', relief='sunken')
+        self.root.after(200, lambda: self.non_member_btn.config(bg=original_bg, relief=original_relief))
+    
+    def activate_buzzer_5_times(self):
+        """Activate the physical buzzer 5 times with beep pattern"""
+        self.buzzer_active = True
+        
+        print("BUZZER: Activating buzzer 5 times to notify staff!")
+        
+        try:
+            for i in range(5):
+                if not self.buzzer_active:
+                    break
+                    
+                print(f"🔊 BUZZ {i+1}/5")
+                
+                # Turn on buzzer (0.3 seconds beep)
+                GPIO.output(BUZZER_PIN, GPIO.HIGH)
+                time.sleep(0.3)
+                
+                # Turn off buzzer (0.2 seconds pause between beeps)
+                GPIO.output(BUZZER_PIN, GPIO.LOW)
+                
+                if i < 4:
+                    time.sleep(0.2)
+            
+            print("BUZZER: 5 beeps completed!")
+            
+        except Exception as e:
+            print(f"Error controlling buzzer: {e}")
+        
+        self.buzzer_active = False
+        
+        # Update UI after buzzer stops
+        if self.button_monitor_active:
+            self.root.after(0, self.buzzer_complete)
+    
+    def buzzer_complete(self):
+        """Called when buzzer completes its cycle"""
+        self.status_label.config(
+            text="✅ Staff Notified!\nPlease wait for assistance",
+            font=('Arial', 20, 'bold'),
+            fg='green',
+            bg='white'
+        )
+        
+        print("Buzzer stopped - Staff has been notified with 5 beeps")
+        
+        # Re-enable button after 5 seconds
+        self.root.after(5000, self.reset_ui)
+    
+    def reset_ui(self):
+        """Reset UI to initial state"""
+        self.non_member_btn.config(state='normal')
+        self.status_label.config(
+            text="Members: Tap RFID Card\nNon-Members: Press Button Below",
+            fg='black',
+            bg='white',
+            font=('Arial', 18, 'bold')
+        )
+        print("UI reset - Ready for next request")
+    
+    # ========== RFID SYSTEM ==========
+    def load_mapping(self):
+        """Load RFID mapping from file"""
+        if os.path.exists(MAPPING_FILE):
+            try:
+                with open(MAPPING_FILE, 'r') as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+    
+    def save_mapping(self):
+        """Save mapping to file"""
+        try:
+            with open(MAPPING_FILE, 'w') as f:
+                json.dump(self.RFID_MAPPING, indent=2, fp=f)
+            return True
+        except Exception as e:
+            print(f"{Colors.RED}Error saving mapping: {e}{Colors.RESET}")
+            return False
+    
+    def check_api_health(self):
+        """Check if API is online"""
+        try:
+            response = requests.get(f"{BASE_URL}/heartbeat", timeout=5)
+            data = response.json()
+            return data.get("success", False)
+        except:
+            return False
+    
+    def verify_rfid_with_api(self, rfid_number):
+        """Verify RFID through the API"""
+        try:
+            print(f"{Colors.BLUE}🔍 Verifying RFID: {rfid_number}{Colors.RESET}")
+            
+            payload = {
+                "rfid": rfid_number,
+                "device_id": DEVICE_ID
+            }
+            
+            response = requests.post(
+                f"{BASE_URL}/verify-rfid",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=API_TIMEOUT
+            )
+            
+            data = response.json()
+            
+            if data.get("success"):
+                member = data.get("member", {})
+                member_name = member.get('name', 'Member')
+                print(f"{Colors.GREEN}✅ ACCESS GRANTED{Colors.RESET}")
+                print(f"{Colors.GREEN}👤 Welcome: {member_name}{Colors.RESET}")
+                
+                # Show membership details
+                if member.get('type'):
+                    print(f"   Type: {member.get('type')}")
+                if member.get('membership_plan'):
+                    print(f"   Plan: {member.get('membership_plan')}")
+                if member.get('is_expiring_soon'):
+                    print(f"{Colors.YELLOW}   ⚠️  Expires in {member.get('days_remaining')} days!{Colors.RESET}")
+                
+                # Return only the welcome message without entry/exit recording
+                return True, f"Welcome, {member_name}!", member_name
+            else:
+                # Check for specific error cases
+                message = data.get("message", "Access denied")
+                member = data.get("member", {})
+                
+                # Check if card exists but membership is expired
+                if member and member.get('is_expired'):
+                    custom_message = "Sorry, your subscription has expired"
+                    print(f"{Colors.RED}❌ EXPIRED MEMBERSHIP{Colors.RESET}")
+                    print(f"{Colors.RED}   Member: {member.get('name', 'Unknown')}{Colors.RESET}")
+                    return False, custom_message, member.get('name', '')
+                # Check if card is not registered
+                elif "not found" in message.lower() or "not registered" in message.lower() or "invalid" in message.lower():
+                    custom_message = "Access Denied: Unregistered Card"
+                    print(f"{Colors.RED}❌ UNREGISTERED CARD{Colors.RESET}")
+                    return False, custom_message, ""
+                else:
+                    # Generic access denied
+                    print(f"{Colors.RED}❌ ACCESS DENIED{Colors.RESET}")
+                    return False, message, ""
+                
+        except requests.exceptions.Timeout:
+            print(f"{Colors.RED}❌ API Timeout - No response from server{Colors.RESET}")
+            return False, "API timeout", ""
+        except requests.exceptions.RequestException as e:
+            print(f"{Colors.RED}❌ API Error: {e}{Colors.RESET}")
+            return False, f"API error: {str(e)}", ""
+        except Exception as e:
+            print(f"{Colors.RED}❌ Unexpected error: {e}{Colors.RESET}")
+            return False, f"Error: {str(e)}", ""
+    
+    def try_auto_learn(self, hex_uid):
+        """Try to auto-learn a card by testing different conversions"""
+        if not AUTO_LEARN:
+            return None
+        
+        hex_clean = hex_uid.replace(" ", "").upper()
+        
+        print(f"{Colors.CYAN}🔍 Auto-learning: Testing possible formats...{Colors.RESET}")
+        
+        # Generate all possible conversions
+        conversions = {}
+        
+        try:
+            # 1. Direct hex to decimal
+            conversions["direct"] = str(int(hex_clean, 16)).zfill(10)
+            
+            # 2. Reversed bytes
+            bytes_list = [hex_clean[i:i+2] for i in range(0, len(hex_clean), 2)]
+            reversed_hex = ''.join(reversed(bytes_list))
+            conversions["reversed"] = str(int(reversed_hex, 16)).zfill(10)
+            
+            # 3. Little endian
+            conversions["little_endian"] = str(int.from_bytes(bytes.fromhex(hex_clean), 'little')).zfill(10)
+        except:
+            pass
+        
+        # Try each conversion
+        for method, rfid in conversions.items():
+            try:
+                print(f"{Colors.CYAN}  Testing {method}: {rfid}...{Colors.RESET}")
+                
+                payload = {"rfid": rfid, "device_id": DEVICE_ID}
+                response = requests.post(
+                    f"{BASE_URL}/verify-rfid",
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=3
+                )
+                
+                data = response.json()
+                
+                if data.get("success"):
+                    member = data.get("member", {})
+                    print(f"{Colors.GREEN}✓ FOUND! Method '{method}' → {rfid}{Colors.RESET}")
+                    print(f"{Colors.Green}  Member: {member.get('name', 'Unknown')}{Colors.RESET}")
+                    
+                    # Save to mapping
+                    self.RFID_MAPPING[hex_clean] = rfid
+                    if self.save_mapping():
+                        print(f"{Colors.GREEN}{Colors.BOLD}✅ CARD LEARNED AND SAVED!{Colors.RESET}")
+                        print(f"{Colors.GREEN}   Mapping: {hex_clean} → {rfid}{Colors.RESET}")
+                    
+                    return rfid
+                    
+            except Exception as e:
+                continue
+        
+        print(f"{Colors.RED}❌ Card not found in database{Colors.RESET}")
+        print(f"{Colors.YELLOW}   Please register this card in your PWA first{Colors.RESET}")
+        return None
+    
+    def extract_rfid_from_line(self, line):
+        """Extract RFID UID from ESP32 serial output"""
+        # Look for UID line like: "UID: F3 E2 18 29"
+        if "UID:" in line:
+            # Extract everything after "UID:"
+            uid_part = line.split("UID:")[1].strip()
+            hex_uid = uid_part.replace(" ", "").upper()
+            
+            print(f"{Colors.CYAN}   Hex UID: {uid_part}{Colors.RESET}")
+            
+            # Check if we have a mapping for this card
+            if hex_uid in self.RFID_MAPPING:
+                rfid = self.RFID_MAPPING[hex_uid]
+                print(f"{Colors.GREEN}   ✓ Found in mapping → {rfid}{Colors.RESET}")
+                return rfid
+            
+            # No mapping found - try auto-learning
+            print(f"{Colors.YELLOW}   ⚠️  Not in mapping, attempting auto-learn...{Colors.RESET}")
+            learned_rfid = self.try_auto_learn(uid_part)
+            
+            if learned_rfid:
+                return learned_rfid
+            
+            # If auto-learning fails, return the original hex UID so it can still be sent to API
+            # This ensures unregistered cards still get proper feedback
+            print(f"{Colors.YELLOW}   ⚠️  Auto-learning failed, using hex UID for API verification{Colors.RESET}")
+            return hex_uid
+        
+        return None
+    
+    def start_rfid_monitoring(self):
+        """Start RFID monitoring in a separate thread"""
+        def monitor_rfid():
+            last_rfid = None
+            last_rfid_time = 0
+            
+            print("Starting RFID monitoring...")
+            
+            while self.rfid_scanning_active:
+                try:
+                    if self.ser and self.ser.in_waiting > 0:
+                        line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                        if line:
+                            timestamp = datetime.now().strftime("%H:%M:%S")
+                            print(f"📨 [{timestamp}] {line}")
+                            
+                            # Extract RFID UID from the line
+                            rfid = self.extract_rfid_from_line(line)
+                            
+                            if rfid:
+                                # Prevent duplicate reads within 3 seconds
+                                current_time = time.time()
+                                if rfid == last_rfid and (current_time - last_rfid_time) < 3:
+                                    print(f"{Colors.YELLOW}⏭️  Duplicate read ignored{Colors.RESET}")
+                                    continue
+                                
+                                last_rfid = rfid
+                                last_rfid_time = current_time
+                                
+                                print(f"\n{Colors.BOLD}{'='*70}{Colors.RESET}")
+                                print(f"{Colors.BOLD}📇 RFID for API: {rfid}{Colors.RESET}")
+                                
+                                # Verify with API
+                                access_granted, message, member_name = self.verify_rfid_with_api(rfid)
+                                
+                                if access_granted:
+                                    # Update UI with just the welcome message
+                                    self.root.after(0, lambda: self.show_member_welcome(member_name))
+                                    
+                                    # Open gate
+                                    self.open_gate()
+                                    print(f"{Colors.GREEN}Gate opened for {GATE_OPEN_TIME} seconds{Colors.RESET}")
+                                    
+                                    # Keep gate open
+                                    time.sleep(GATE_OPEN_TIME)
+                                    
+                                    # Close gate
+                                    self.close_gate()
+                                    print(f"{Colors.GREEN}✅ Transaction complete{Colors.RESET}")
+                                    
+                                    # Reset UI after delay
+                                    self.root.after(3000, self.reset_ui)
+                                else:
+                                    # Show appropriate denial message
+                                    self.root.after(0, lambda: self.show_access_denied(message, member_name))
+                                    print(f"{Colors.RED}❌ ACCESS DENIED{Colors.RESET}")
+                                    print(f"{Colors.RED}   Reason: {message}{Colors.RESET}")
+                                    
+                                    # Reset UI after delay
+                                    self.root.after(3000, self.reset_ui)
+                                
+                                print(f"{Colors.BOLD}{'='*70}{Colors.RESET}\n")
+                    
+                    time.sleep(0.01)
+                    
+                except Exception as e:
+                    print(f"{Colors.RED}❌ RFID Monitoring Error: {e}{Colors.RESET}")
+                    time.sleep(1)
+        
+        self.rfid_thread = threading.Thread(target=monitor_rfid, daemon=True)
+        self.rfid_thread.start()
+        print("✅ RFID monitoring started")
+    
+    def show_member_welcome(self, member_name):
+        """Display welcome message with just the member name"""
+        welcome_text = f"Welcome, {member_name}!"
+        self.status_label.config(
+            text=welcome_text,
+            fg='green',
+            font=('Arial', 18, 'bold')
+        )
+    
+    def show_access_denied(self, message, member_name=""):
+        """Display appropriate access denied message"""
+        if member_name:
+            # Expired membership case
+            denial_text = f"Sorry {member_name},\n{message}"
+        else:
+            # Not a member case
+            denial_text = f"{message}"
+        
+        self.status_label.config(
+            text=denial_text,
+            fg='red',
+            font=('Arial', 18, 'bold')
+        )
+    
+    def update_status(self, text, color):
+        """Update main status label"""
+        self.status_label.config(text=text, fg=color, font=('Arial', 18, 'bold'))
+    
+    # ========== CLEANUP ==========
+    def stop_buzzer(self):
+        """Immediately stop the buzzer"""
+        self.buzzer_active = False
+        try:
+            GPIO.output(BUZZER_PIN, GPIO.LOW)
+        except:
+            pass
+    
+    def cleanup(self):
+        """Cleanup resources"""
+        print("🔌 Cleaning up...")
+        self.button_monitor_active = False
+        self.rfid_scanning_active = False
+        self.stop_buzzer()
+        
+        # Stop servo
+        if self.pi.connected:
+            self.pi.set_servo_pulsewidth(SERVO_PIN, 0)
+            self.pi.stop()
+            print("Servo turned off")
+        
+        # Close serial connection
+        if self.ser:
+            self.ser.close()
+            print("Serial connection closed")
+        
+        try:
+            GPIO.cleanup()
+            print("GPIO cleaned up")
+        except:
+            pass
+
+# ========== MAIN EXECUTION ==========
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = IntegratedGymSystem(root)
+    
+    # Add escape key to exit fullscreen
+    def exit_fullscreen(event=None):
+        app.cleanup()
+        root.attributes('-fullscreen', False)
+        root.destroy()
+    
+    root.bind('<Escape>', exit_fullscreen)
+    
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        print("Interrupted by user")
+    finally:
+        app.cleanup()
